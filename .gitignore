@@ -1,0 +1,284 @@
+/password
+config.ini
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pyd
+
+# Cython build artifacts (generated; avoid shadowing .py during local dev)
+unicrawler/**/*.c
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# ============================================
+# 项目特定的忽略规则
+# ============================================
+
+# 日志文件
+logs/
+*.log
+*.log.*
+
+# 数据文件
+data/
+output/
+results/
+downloads/
+cache/
+
+# 配置文件（本地化，不同开发者）
+.env.local
+.env.*.local
+config.local.json
+settings.local.json
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# OS 特定文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 浏览器相关（爬虫模块）
+user-data-dir/
+chrome-profile/
+chrome_cdp_profile/
+chrome_cdp_profile_*/
+.chromium/
+.browser-use/
+selenium/
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+
+# API Keys 和敏感信息（不要提交！）
+.secrets/
+secrets.json
+credentials.json
+api_keys.json
+user_archive.json
+*.pem
+*.key
+*.crt
+
+# 爬虫相关的临时输出
+crawl_output/
+screenshots/
+html_snapshots/
+dom_snapshots/
+
+# 搜索结果缓存
+search_cache/
+*.cache
+
+# Playwright/Puppeteer 相关
+.playwright/
+.puppeteer/
+
+# 项目特定的大文件
+*.zip
+*.tar.gz
+*.rar
+large_files/
+
+# 虚拟环境相关
+venv*/
+env*/
+.venv*/
+
+# 编辑器备份文件
+*.swp
+*.swo
+*~
+.#*
+
+# Node.js（如果有前端部分）
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Python 虚拟环境特定
+pip-log.txt
+pip-delete-this-directory.txt
+
+# MacOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+.directory
+
+# 项目特定的输出目录
+/output/
+/temp/
+/tmp/
+/cache/
+
+# 不追踪个人配置
+local.conf
+personal.conf
+my_api_keys.py
+
+# 爬虫下载的文件
+downloads/
+data/
+
+chrome_cdp_profile/
+login_profile/
+.github/
+
+# --- Cython / binary build ignores ---
+*.pyd
+*.c
+*.cpp
+*.pyx.c
+*.pyx.cpp
+*.html
+**/__pycache__/
+login_profiles/
+res*.json
+*.backup

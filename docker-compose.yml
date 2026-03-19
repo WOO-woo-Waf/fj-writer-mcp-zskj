@@ -1,0 +1,61 @@
+services:
+  mcp-service:
+    build:
+      context: ./mcp-with-law-article
+      dockerfile: Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
+    container_name: mcp-service
+    restart: unless-stopped
+    ports:
+      - "11452:8000"
+    volumes:
+      - ./mcp-with-law-article/config.ini:/app/config.ini:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MCP_ALLOWED_HOSTS=mcp-service:*,writer-service:*
+    cpus: "1.0"
+    mem_limit: 1024m
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
+
+  writer-service:
+    build:
+      context: ./writer-for-fujian
+      dockerfile: Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
+    container_name: writer-service
+    restart: unless-stopped
+    depends_on:
+      - mcp-service
+    ports:
+      - "11453:8000"
+    env_file:
+      - ./writer-for-fujian/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MCP_SSE_URL=http://mcp-service:8000/sse
+      - MCP_FORCE_HOST_HEADER=127.0.0.1:8000
+    cpus: "2.0"
+    mem_limit: 2048m
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 20s
+
+networks:
+  default:
+    name: fujian-services-net
