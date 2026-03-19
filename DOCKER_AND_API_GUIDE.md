@@ -15,12 +15,16 @@ docker compose up -d --force-recreate writer-service
 
 cd /data/app/fj-writer-mcp
 
-# 重建写作服务（因为改了 writer 代码）
-sudo docker compose build --no-cache writer-service
-sudo docker compose up -d --force-recreate writer-service
+# 重要：检索链路改动后必须重建两个服务（mcp + writer）
+sudo docker compose build mcp-service writer-service
+sudo docker compose up -d --force-recreate mcp-service writer-service
 
-# 可选：把 mcp 也重启一遍
-sudo docker compose up -d --force-recreate mcp-service
+# 查看是否为新容器（启动时间会刷新）
+sudo docker compose ps
+
+# 观察两端日志，确认检索参数已生效
+sudo docker compose logs -f mcp-service
+sudo docker compose logs -f writer-service
 
 ## 1) Dockerfile 是什么
 

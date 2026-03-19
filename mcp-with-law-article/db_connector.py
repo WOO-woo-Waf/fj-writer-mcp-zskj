@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import configparser
 import os
+import re
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -130,22 +131,104 @@ class LegalDatabaseConnector:
         return parsed
 
     def get_article(self, number: str, title: str) -> Optional[Dict[str, Any]]:
+        number_candidates = self._build_article_number_candidates(number)
         query = f"""
             SELECT id, title, section_number, content, url, created_at, updated_at
             FROM {self.tables['law_article']}
-            WHERE section_number = %s
-              AND title ILIKE %s
+            WHERE title ILIKE %s
+              AND (section_number ILIKE %s OR content ILIKE %s)
             ORDER BY id
             LIMIT 1
         """
         connection = self._get_connection()
         try:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(query, (number, f"%{title}%"))
-                row = cursor.fetchone()
-                return self._normalize_record(dict(row)) if row else None
+                for candidate in number_candidates:
+                    like_candidate = f"%{candidate}%"
+                    cursor.execute(query, (f"%{title}%", like_candidate, like_candidate))
+                    row = cursor.fetchone()
+                    if row:
+                        return self._normalize_record(dict(row))
+                return None
         finally:
             self._release_connection(connection)
+
+    @staticmethod
+    def _arabic_to_chinese_number(value: int) -> str:
+        """Convert 0-9999 integer to Chinese numerals used in article numbers."""
+        if value == 0:
+            return "零"
+
+        digits = "零一二三四五六七八九"
+        units = [(1000, "千"), (100, "百"), (10, "十")]
+
+        parts: List[str] = []
+        remainder = value
+        need_zero = False
+
+        for unit_value, unit_name in units:
+            digit = remainder // unit_value
+            remainder %= unit_value
+            if digit > 0:
+                if need_zero:
+                    parts.append("零")
+                    need_zero = False
+                if not (unit_value == 10 and digit == 1 and not parts):
+                    parts.append(digits[digit])
+                parts.append(unit_name)
+            elif parts and remainder > 0:
+                need_zero = True
+
+        if remainder > 0:
+            if need_zero:
+                parts.append("零")
+            parts.append(digits[remainder])
+
+        return "".join(parts)
+
+    def _build_article_number_candidates(self, number: str) -> List[str]:
+        """Build robust article number variants (Arabic and Chinese forms)."""
+        text = (number or "").strip()
+        if not text:
+            return []
+
+        candidates: List[str] = [text]
+        compact = re.sub(r"\s+", "", text)
+        if compact not in candidates:
+            candidates.append(compact)
+
+        match = re.search(r"(\d+)", compact)
+        if match:
+            arabic = int(match.group(1))
+            zh_num = self._arabic_to_chinese_number(arabic)
+            zh_article = f"第{zh_num}条"
+            simple_article = f"第{arabic}条"
+            bare_num = str(arabic)
+
+            for item in [simple_article, zh_article, bare_num, zh_num]:
+                if item and item not in candidates:
+                    candidates.append(item)
+
+        return candidates
+
+    @staticmethod
+    def _tokenize_search_text(text: str) -> List[str]:
+        """Split multi-keyword query into meaningful tokens."""
+        raw = (text or "").strip()
+        if not raw:
+            return []
+
+        chunks = [piece.strip() for piece in re.split(r"[\s,，;；、|/]+", raw) if piece.strip()]
+        deduped: List[str] = []
+        seen = set()
+        for chunk in chunks:
+            if len(chunk) <= 1:
+                continue
+            if chunk in seen:
+                continue
+            seen.add(chunk)
+            deduped.append(chunk)
+        return deduped or [raw]
 
     def search_articles(
         self,
@@ -168,11 +251,33 @@ class LegalDatabaseConnector:
         page_size = self._parse_int_value(page_size, default=10, min_value=1, max_value=100)
         offset = (page - 1) * page_size
 
-        relevance_expr = (
-            "(CASE WHEN title ILIKE %s THEN 1 ELSE 0 END) * 3 + "
-            "(CASE WHEN section_number ILIKE %s THEN 1 ELSE 0 END) * 2 + "
-            "(CASE WHEN content ILIKE %s THEN 1 ELSE 0 END)"
-        )
+        tokens = self._tokenize_search_text(text)
+        phrase_like = f"%{text}%"
+
+        relevance_parts = [
+            "(CASE WHEN title ILIKE %s THEN 1 ELSE 0 END) * 4",
+            "(CASE WHEN section_number ILIKE %s THEN 1 ELSE 0 END) * 3",
+            "(CASE WHEN content ILIKE %s THEN 1 ELSE 0 END) * 2",
+        ]
+        relevance_params: List[Any] = [phrase_like, phrase_like, phrase_like]
+
+        where_clauses: List[str] = []
+        where_params: List[Any] = []
+
+        # 多关键词语义：每个关键词至少命中一个字段（AND across terms）。
+        for token in tokens:
+            token_like = f"%{token}%"
+            where_clauses.append("(title ILIKE %s OR content ILIKE %s OR section_number ILIKE %s)")
+            where_params.extend([token_like, token_like, token_like])
+            relevance_parts.append("(CASE WHEN title ILIKE %s THEN 1 ELSE 0 END) * 3")
+            relevance_parts.append("(CASE WHEN section_number ILIKE %s THEN 1 ELSE 0 END) * 2")
+            relevance_parts.append("(CASE WHEN content ILIKE %s THEN 1 ELSE 0 END)")
+            relevance_params.extend([token_like, token_like, token_like])
+
+        relevance_expr = " + ".join(relevance_parts)
+        where_expr = " AND ".join(where_clauses) if where_clauses else "(title ILIKE %s OR content ILIKE %s OR section_number ILIKE %s)"
+        if not where_clauses:
+            where_params.extend([phrase_like, phrase_like, phrase_like])
 
         order_by = "relevance DESC, updated_at DESC NULLS LAST, id DESC"
         if sort_key != "relevance":
@@ -182,23 +287,11 @@ class LegalDatabaseConnector:
             SELECT id, title, section_number, content, url, created_at, updated_at,
                    {relevance_expr} AS relevance
             FROM {self.tables['law_article']}
-            WHERE title ILIKE %s
-               OR content ILIKE %s
-               OR section_number ILIKE %s
+            WHERE {where_expr}
             ORDER BY {order_by}
             LIMIT %s OFFSET %s
         """
-        like_text = f"%{text}%"
-        params = (
-            like_text,
-            like_text,
-            like_text,
-            like_text,
-            like_text,
-            like_text,
-            page_size,
-            offset,
-        )
+        params = tuple(relevance_params + where_params + [page_size, offset])
         connection = self._get_connection()
         try:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:

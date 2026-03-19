@@ -47,6 +47,8 @@ class WritingConfig:
     enforce_task_alignment: bool = True
     initial_case_repeat: int = 1
     initial_task_repeat: int = 1
+    max_actions_per_turn: int = 5
+    max_legal_results_for_observation: int = 30
 
 
 @dataclass
@@ -115,6 +117,7 @@ class ReactWritingEngine:
         self.steps: List[ReactStep] = []
         self.dialogue_turns: List[DialogueTurn] = []
         self.legal_references: List[Dict[str, Any]] = []
+        self.proactive_legal_references: List[Dict[str, Any]] = []
         self.retrieved_contents: List[Dict[str, Any]] = []
         
         logger.info("ReactWritingEngine initialized")
@@ -257,6 +260,7 @@ class ReactWritingEngine:
         self.steps = []
         self.dialogue_turns = []
         self.legal_references = []
+        self.proactive_legal_references = []
         self.retrieved_contents = []
         
         # 构建初始提示
@@ -272,7 +276,7 @@ class ReactWritingEngine:
             proactive_queries = self._build_proactive_queries(task_description, context)
             for proactive_query in proactive_queries[: self.config.proactive_max_queries]:
                 logger.info(f"Proactive MCP search query: {proactive_query}")
-                proactive_observation = await self._tool_search_legal(proactive_query, context)
+                proactive_observation = await self._tool_search_legal(proactive_query, context, record_reference=False)
                 self.steps.append(
                     ReactStep(
                         step_number=0,
@@ -287,7 +291,7 @@ class ReactWritingEngine:
             parsed_articles = self._extract_article_requests(task_description + "\n" + context)
             for title, number in parsed_articles[:2]:
                 logger.info(f"Proactive MCP get_article: title={title}, number={number}")
-                article_observation = await self._tool_get_article(f"{title}|{number}", context)
+                article_observation = await self._tool_get_article(f"{title}|{number}", context, record_reference=False)
                 self.steps.append(
                     ReactStep(
                         step_number=0,
@@ -314,7 +318,12 @@ class ReactWritingEngine:
                     temperature=self.config.temperature
                 )
                 self.dialogue_turns.append(DialogueTurn(role="assistant", message=content))
-                logger.debug(f"Step {step_num} Response: {content[:200]}...")
+                logger.info(
+                    "Step %s Assistant response length=%s\n---BEGIN_ASSISTANT_RESPONSE---\n%s\n---END_ASSISTANT_RESPONSE---",
+                    step_num,
+                    len(content),
+                    content,
+                )
             except Exception as e:
                 logger.error(f"LLM调用失败: {e}")
                 return self._build_error_result(f"LLM调用失败: {str(e)}")
@@ -333,13 +342,14 @@ class ReactWritingEngine:
             )
             
             # 2. 解析动作
-            action_info = self._parse_action(content)
+            action_list = self._parse_actions(content)
             
-            if not action_info:
+            if not action_list:
                 # 没有解析出动作，提示继续
-                if "FINISH" in content.upper():
+                if self._has_finish_signal(content):
                     final_content = self._extract_finish_content(content)
                     current_step.action = "FINISH"
+                    current_step.observation = "任务完成"
                     self.steps.append(current_step)
                     break
                 
@@ -352,48 +362,82 @@ class ReactWritingEngine:
                 )
                 self.steps.append(current_step)
                 continue
-            
-            action_name, action_input = action_info
-            current_step.action = action_name
-            current_step.action_input = action_input
-            logger.info(f"Step {step_num} Action: {action_name} | input={action_input[:200]}")
-            
-            # 3. 执行工具
-            if action_name == "FINISH":
-                final_content = action_input
-                current_step.observation = "任务完成"
-                logger.info(f"Step {step_num} FINISH with length={len(final_content)}")
-                self.steps.append(current_step)
+
+            if len(action_list) > 1:
+                logger.warning(
+                    "Model returned multiple actions in one turn; executing sequentially. count=%s",
+                    len(action_list),
+                )
+
+            loop_should_break = False
+            for action_idx, (action_name, action_input) in enumerate(action_list[: self.config.max_actions_per_turn], start=1):
+                step_record = current_step if action_idx == 1 else ReactStep(step_number=step_num, thought=current_step.thought)
+                step_record.action = action_name
+                step_record.action_input = action_input
+
+                logger.info(
+                    "Step %s Action %s/%s: %s | input_len=%s\n---BEGIN_ACTION_INPUT---\n%s\n---END_ACTION_INPUT---",
+                    step_num,
+                    action_idx,
+                    min(len(action_list), self.config.max_actions_per_turn),
+                    action_name,
+                    len(action_input),
+                    action_input,
+                )
+
+                # 3. 执行工具
+                if action_name == "FINISH":
+                    final_content = action_input
+                    step_record.observation = "任务完成"
+                    logger.info(f"Step {step_num} FINISH with length={len(final_content)}")
+                    self.steps.append(step_record)
+                    loop_should_break = True
+                    break
+
+                if action_name not in self.tools:
+                    observation = f"错误：未知工具 '{action_name}'。请从可用工具列表中选择。"
+                    step_record.error = observation
+                else:
+                    try:
+                        tool_func = self.tools[action_name]
+                        observation = await tool_func(action_input, context)
+                        step_record.observation = observation
+                        logger.info(
+                            "Step %s Observation for action %s length=%s\n---BEGIN_OBSERVATION---\n%s\n---END_OBSERVATION---",
+                            step_num,
+                            action_name,
+                            len(str(observation)),
+                            str(observation),
+                        )
+                    except Exception as e:
+                        observation = f"工具执行失败: {str(e)}"
+                        step_record.error = observation
+                        logger.error(f"Tool {action_name} failed: {e}", exc_info=True)
+
+                self.steps.append(step_record)
+                self.dialogue_turns.append(
+                    DialogueTurn(role="tool", message=f"{action_name}: {str(observation)}")
+                )
+
+                # 4. 将观察结果反馈给模型
+                observation_text = self._truncate_text(str(observation), self.config.max_turn_text_chars)
+                messages.append(Message(role="user", content=f"Observation: {observation_text}"))
+                self.dialogue_turns.append(DialogueTurn(role="user", message=f"Observation: {observation}"))
+
+                # 检查上下文长度
+                if self._estimate_context_length(messages) > self.config.context_window_limit:
+                    logger.warning("上下文长度接近限制，进行压缩")
+                    messages = self._compress_context(messages)
+
+            if len(action_list) > self.config.max_actions_per_turn:
+                logger.warning(
+                    "Actions exceed max_actions_per_turn=%s, skipped=%s",
+                    self.config.max_actions_per_turn,
+                    len(action_list) - self.config.max_actions_per_turn,
+                )
+
+            if loop_should_break:
                 break
-            
-            if action_name not in self.tools:
-                observation = f"错误：未知工具 '{action_name}'。请从可用工具列表中选择。"
-                current_step.error = observation
-            else:
-                try:
-                    tool_func = self.tools[action_name]
-                    observation = await tool_func(action_input, context)
-                    current_step.observation = observation
-                    logger.info(f"Step {step_num} Observation: {str(observation)[:300]}")
-                except Exception as e:
-                    observation = f"工具执行失败: {str(e)}"
-                    current_step.error = observation
-                    logger.error(f"Tool {action_name} failed: {e}", exc_info=True)
-            
-            self.steps.append(current_step)
-            self.dialogue_turns.append(
-                DialogueTurn(role="tool", message=f"{action_name}: {str(observation)[:1000]}")
-            )
-            
-            # 4. 将观察结果反馈给模型
-            observation_text = self._truncate_text(str(observation), self.config.max_turn_text_chars)
-            messages.append(Message(role="user", content=f"Observation: {observation_text}"))
-            self.dialogue_turns.append(DialogueTurn(role="user", message=f"Observation: {observation}"))
-            
-            # 检查上下文长度
-            if self._estimate_context_length(messages) > self.config.context_window_limit:
-                logger.warning("上下文长度接近限制，进行压缩")
-                messages = self._compress_context(messages)
 
         if self.config.force_final_synthesis:
             final_content = await self._run_final_round_with_special_prompt(
@@ -509,52 +553,72 @@ class ReactWritingEngine:
             return match.group(1).strip()
         return ""
     
+    def _parse_actions(self, content: str) -> List[Tuple[str, str]]:
+        """解析Action列表，支持同轮多动作按顺序执行。"""
+        matches = re.findall(r"Action\s*[:：]\s*(\w+)\s*[:：]\s*(.+?)(?=\n|$)", content, re.DOTALL | re.IGNORECASE)
+        return [(tool_name.strip(), tool_args.strip()) for tool_name, tool_args in matches]
+
     def _parse_action(self, content: str) -> Optional[tuple]:
-        """解析Action"""
-        # 格式: Action: tool_name: args
-        match = re.search(r"Action:\s*(\w+):\s*(.+?)(?=\n|$)", content, re.DOTALL | re.IGNORECASE)
-        if match:
-            tool_name = match.group(1).strip()
-            tool_args = match.group(2).strip()
-            return tool_name, tool_args
-        return None
+        """兼容方法：返回首个Action。"""
+        actions = self._parse_actions(content)
+        return actions[0] if actions else None
+
+    def _has_finish_signal(self, content: str) -> bool:
+        """判断模型输出是否包含显式 FINISH 动作。"""
+        if not content:
+            return False
+        return bool(re.search(r"Action\s*[:：]\s*FINISH\s*[:：]", content, re.IGNORECASE))
     
     def _extract_finish_content(self, content: str) -> str:
         """提取FINISH后的内容"""
-        match = re.search(r"FINISH:\s*(.+)", content, re.DOTALL | re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
+        # 兼容多次 FINISH，默认取最后一条，避免前序草稿覆盖最终版本。
+        matches = re.findall(r"FINISH\s*[:：]\s*(.+?)(?=\nAction\s*[:：]|\Z)", content, re.DOTALL | re.IGNORECASE)
+        if matches:
+            return matches[-1].strip()
         return ""
     
     # ==================== 工具实现 ====================
     
-    async def _tool_search_legal(self, query: str, context: str) -> str:
+    async def _tool_search_legal(self, query: str, context: str, record_reference: bool = True) -> str:
         """搜索法律条文"""
         if not self.mcp_client:
             return "法条搜索功能未启用"
         
         try:
-            candidate_queries = [query]
-            if "刑法" not in query:
-                candidate_queries.append(f"{query} 刑法")
+            candidate_queries = self._build_search_query_candidates(query)
 
             results = []
             for candidate in candidate_queries:
-                results = await self.mcp_client.search_article(text=candidate)
-                if results:
+                raw_results = await self.mcp_client.search_article(
+                    text=candidate,
+                    page=1,
+                    page_size=30,
+                    sort_by="relevance",
+                    order="desc",
+                )
+                filtered_results = self._filter_legal_results_by_query(raw_results, query)
+                logger.info(
+                    "search_legal query='%s' candidate='%s' raw_count=%s filtered_count=%s",
+                    query,
+                    candidate,
+                    len(raw_results),
+                    len(filtered_results),
+                )
+                if filtered_results:
+                    results = filtered_results
                     query = candidate
                     break
             
             if not results:
                 return "未找到相关法条"
             
-            # 记录前3条结果
+            # 输出检索结果（默认最多max_legal_results_for_observation条，每条携带完整content给模型）
             output_parts = []
             seen = set()
-            for i, result in enumerate(results[:3], 1):
+            for i, result in enumerate(results[: self.config.max_legal_results_for_observation], 1):
                 title = result.get("title", "未知")
                 article = result.get("section_number", result.get("article", ""))
-                content = result.get("content", "")[:200]
+                content = result.get("content", "")
                 law_id = self._normalize_legal_id(result.get("id"))
                 dedup_key = (title, article, law_id)
                 if dedup_key in seen:
@@ -562,24 +626,91 @@ class ReactWritingEngine:
                 seen.add(dedup_key)
 
                 id_text = law_id if law_id else "未知"
-                output_parts.append(f"{i}. 《{title}》{article} [法条ID:{id_text}]\n   {content}...")
-                
-                # 记录引用
-                self.legal_references.append({
+                output_parts.append(f"{i}. 《{title}》{article} [法条ID:{id_text}]\n{content}")
+
+                # 记录引用（全局去重，避免多轮重复累积同一法条）
+                ref_item = {
                     "law_id": law_id,
                     "title": title,
                     "article": article,
                     "content": result.get("content", ""),
                     "query": query
-                })
+                }
+                if not record_reference:
+                    self._append_unique_reference(self.proactive_legal_references, ref_item)
+                    continue
+
+                ref_key = (ref_item.get("law_id"), ref_item.get("title"), ref_item.get("article"))
+                exists = any(
+                    (item.get("law_id"), item.get("title"), item.get("article")) == ref_key
+                    for item in self.legal_references
+                )
+                if not exists:
+                    self.legal_references.append(ref_item)
             
             return "\n".join(output_parts)
             
         except Exception as e:
             logger.error(f"法条搜索失败: {e}")
             return f"法条搜索失败: {str(e)}"
+
+    def _filter_legal_results_by_query(self, results: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
+        """按查询关键词进行粗相关性过滤，避免把泛结果当作命中。"""
+        if not results:
+            return []
+
+        normalized_query = re.sub(r"\s+", " ", (query or "").strip())
+        if not normalized_query:
+            return results
+
+        generic_terms = {"刑法", "民法", "民法典", "刑事诉讼法", "法律", "法条", "量刑"}
+        tokens = [token for token in re.split(r"\s+", normalized_query) if token]
+        specific_tokens = [token for token in tokens if token not in generic_terms and len(token) >= 2]
+
+        # 无具体关键词时不过滤，避免误杀。
+        if not specific_tokens:
+            return results
+
+        filtered: List[Dict[str, Any]] = []
+        for item in results:
+            haystack = " ".join(
+                [
+                    str(item.get("title") or ""),
+                    str(item.get("section_number") or item.get("article") or ""),
+                    str(item.get("content") or "")[:800],
+                ]
+            )
+            if any(token in haystack for token in specific_tokens):
+                filtered.append(item)
+
+        return filtered
+
+    def _build_search_query_candidates(self, query: str) -> List[str]:
+        """构建搜索候选词，增强多关键词检索鲁棒性。"""
+        base = (query or "").strip()
+        if not base:
+            return []
+
+        candidates: List[str] = [base]
+        tokens = [token for token in re.split(r"[\s,，;；、|/]+", base) if token]
+
+        # 逐词回退：原查询失败时，尝试关键子词检索并利用后续过滤保障相关性。
+        for token in tokens:
+            token = token.strip()
+            if len(token) <= 1:
+                continue
+            if token not in candidates:
+                candidates.append(token)
+
+        # # 常见法律写作查询可追加法域限定词提升召回。
+        # if "刑法" not in base and any(word in base for word in ["诈骗", "盗窃", "量刑", "自首", "共同犯罪"]):
+        #     scoped = f"{base} 刑法"
+        #     if scoped not in candidates:
+        #         candidates.append(scoped)
+
+        return candidates
     
-    async def _tool_get_article(self, params: str, context: str) -> str:
+    async def _tool_get_article(self, params: str, context: str, record_reference: bool = True) -> str:
         """获取具体法条"""
         if not self.mcp_client:
             return "法条搜索功能未启用"
@@ -599,14 +730,24 @@ class ReactWritingEngine:
                 article_text = result.get("content", "") if isinstance(result, dict) else str(result)
                 article_number = result.get("section_number", number) if isinstance(result, dict) else number
                 law_id = self._normalize_legal_id(result.get("id")) if isinstance(result, dict) else None
-                # 记录引用
-                self.legal_references.append({
+                # 记录引用（全局去重，避免重复条文）
+                ref_item = {
                     "law_id": law_id,
                     "title": title,
                     "article": article_number,
                     "content": article_text,
                     "query": params
-                })
+                }
+                if not record_reference:
+                    self._append_unique_reference(self.proactive_legal_references, ref_item)
+                else:
+                    ref_key = (ref_item.get("law_id"), ref_item.get("title"), ref_item.get("article"))
+                    exists = any(
+                        (item.get("law_id"), item.get("title"), item.get("article")) == ref_key
+                        for item in self.legal_references
+                    )
+                    if not exists:
+                        self.legal_references.append(ref_item)
                 id_text = law_id if law_id else "未知"
                 return f"《{title}》{article_number} [法条ID:{id_text}]：\n{article_text}"
             else:
@@ -775,11 +916,30 @@ class ReactWritingEngine:
 
         return unique_refs
 
+    def _append_unique_reference(self, target: List[Dict[str, Any]], ref_item: Dict[str, Any]) -> None:
+        """向目标引用列表中追加一条去重后的法条记录。"""
+        ref_key = (ref_item.get("law_id"), ref_item.get("title"), ref_item.get("article"))
+        exists = any(
+            (item.get("law_id"), item.get("title"), item.get("article")) == ref_key
+            for item in target
+        )
+        if not exists:
+            target.append(ref_item)
+
     def _post_process_legal_citations(self, content: str) -> str:
         """清理输出并按需补法条ID角标（不再无条件强插）。"""
         text = (content or "").strip()
         if not text:
             return text
+
+        # 仅当模型在正式步骤中通过工具拿到法条时，才允许后处理校正角标。
+        # 预搜索结果仅用于前置上下文，不得反向改写终稿，避免固定ID污染。
+        has_formal_legal_step = any(
+            step.step_number > 0 and step.action in {"search_legal", "search_cp", "get_article", "get_cp_article"}
+            for step in self.steps
+        )
+        if not has_formal_legal_step:
+            return re.sub(r"\n{3,}", "\n\n", text).strip()
 
         refs = self._collect_unique_legal_references(without_content=True)
         valid_ids = [ref.get("law_id") for ref in refs if ref.get("law_id")]

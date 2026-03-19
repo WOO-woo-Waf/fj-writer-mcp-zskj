@@ -58,6 +58,20 @@ def _setup_logging() -> logging.Logger:
 
     logger_obj.addHandler(file_handler)
     logger_obj.addHandler(console_handler)
+
+    # Ensure module-level loggers (e.g., app.services.*, app.integrations.*)
+    # are visible in container logs at INFO level.
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    has_stream = any(isinstance(handler, logging.StreamHandler) for handler in root_logger.handlers)
+    has_file = any(isinstance(handler, RotatingFileHandler) for handler in root_logger.handlers)
+    if not has_stream:
+        root_logger.addHandler(console_handler)
+    if not has_file:
+        root_logger.addHandler(file_handler)
+
+    # Avoid duplicate records through both writing_api and root handlers.
+    logger_obj.propagate = False
     return logger_obj
 
 

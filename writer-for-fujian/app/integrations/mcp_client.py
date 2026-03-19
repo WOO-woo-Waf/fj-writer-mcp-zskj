@@ -123,7 +123,14 @@ class LegalMCPClient:
             logger.error("MCP get_article failed: %s\n%s", self._format_exception_detail(e), traceback.format_exc())
             return {}
 
-    async def search_article(self, text: str) -> List[Dict[str, Any]]:
+    async def search_article(
+        self,
+        text: str,
+        page: int | str = 1,
+        page_size: int | str = 20,
+        sort_by: str = "relevance",
+        order: str = "desc",
+    ) -> List[Dict[str, Any]]:
         """
         通过语义检索查找相关法条
         
@@ -134,14 +141,25 @@ class LegalMCPClient:
             List[Dict]: 相关法条列表
         """
         try:
-            logger.info(f"MCP search_article start: text={text}")
+            logger.info(
+                "MCP search_article start: text=%s, page=%s, page_size=%s, sort_by=%s, order=%s",
+                text,
+                page,
+                page_size,
+                sort_by,
+                order,
+            )
             async with sse_client(self.sse_url, headers=self.headers) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     result = await session.call_tool(
                         "search_article",
                         arguments={
-                            "text": text
+                            "text": text,
+                            "page": page,
+                            "page_size": page_size,
+                            "sort_by": sort_by,
+                            "order": order,
                         }
                     )
                     if result.content and len(result.content) > 0:

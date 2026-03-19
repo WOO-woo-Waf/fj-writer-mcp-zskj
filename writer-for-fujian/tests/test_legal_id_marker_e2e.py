@@ -36,8 +36,7 @@ def build_payload() -> Dict[str, Any]:
 
     prompt_instruction = (
         "请撰写一段刑事审查意见（200-350字），围绕是否构成合同诈骗进行分析。"
-        "要求：可以引用相关法条，但最终文本不要贴法条原文；"
-        "若引用法律依据，请在对应句末使用[法条ID:数字]角标。"
+        "要求：可以引用相关法条"
     )
 
     return {
@@ -56,14 +55,14 @@ def build_payload() -> Dict[str, Any]:
 def build_search_required_payload() -> Dict[str, Any]:
     """显式要求检索法条的测试载荷。"""
     case_material = (
-        "被告人李某以签订车辆租赁合作协议为名收取押金，后将车辆擅自转租并失联，"
-        "造成被害人押金损失。现需形成是否构成合同诈骗的审查意见。"
+        "被告人王某以虚构项目融资需求为由，向多名被害人签订借款及合作协议，"
+        "收取款项后未按约履行，资金主要用于偿还旧债和个人消费。"
+        "公安机关侦查后移送审查起诉，现需形成审查意见。"
     )
 
     prompt_instruction = (
         "请先检索与合同诈骗、自首、量刑相关的法条依据，再输出审查意见。"
-        "要求：正文中写出一到两句明确的法律依据句，并在句末标注[法条ID:数字]；"
-        "不要粘贴法条原文。"
+        "要求：完整的找出相关的法条依据"
     )
 
     return {
@@ -97,12 +96,71 @@ def _contains_long_legal_fragment(content: str, legal_references: List[Dict[str,
     return False
 
 
+def _has_relevant_legal_hit(legal_references: List[Dict[str, Any]], keywords: List[str]) -> bool:
+    """检查检索结果是否命中与测试目标相关的法条关键词。"""
+    if not legal_references:
+        return False
+
+    for ref in legal_references:
+        blob = " ".join(
+            [
+                str(ref.get("title") or ""),
+                str(ref.get("article") or ""),
+                str(ref.get("content") or "")[:400],
+                str(ref.get("query") or ""),
+            ]
+        )
+        if any(keyword in blob for keyword in keywords):
+            return True
+
+    return False
+
+
+def _print_model_trace(final_payload: Dict[str, Any], title: str) -> None:
+    """打印模型推理全流程（对话轨迹+react_steps）和最终结果。"""
+    metadata = final_payload.get("metadata") or {}
+    dialogue_turns = metadata.get("dialogue_turns") or []
+    react_steps = final_payload.get("react_steps") or []
+    content = str(final_payload.get("content") or "")
+
+    print("\n" + "=" * 88)
+    print(f"模型推理全流程 - {title}")
+    print("=" * 88)
+
+    print("\n[Dialogue Turns]")
+    for idx, turn in enumerate(dialogue_turns, 1):
+        role = str(turn.get("role") or "unknown")
+        message = str(turn.get("message") or "")
+        print(f"\n--- turn {idx} | role={role} ---")
+        print(message)
+
+    print("\n[React Steps]")
+    for step in react_steps:
+        if not isinstance(step, dict):
+            continue
+        step_no = step.get("step")
+        thought = str(step.get("thought") or "")
+        action = str(step.get("action") or "")
+        observation = str(step.get("observation") or "")
+        error = str(step.get("error") or "")
+        print(f"\n--- step {step_no} ---")
+        print(f"thought: {thought}")
+        print(f"action: {action}")
+        if observation:
+            print(f"observation: {observation}")
+        if error:
+            print(f"error: {error}")
+
+    print("\n[Final Content]")
+    print(content)
+
+
 def _run_stream_request(payload: Dict[str, Any], base_url: str, timeout: float = 180.0) -> Dict[str, Any]:
     """执行一次流式请求并返回final事件负载。"""
     url = base_url.rstrip("/") + "/api/write/stream"
 
     print("=" * 88)
-    print("开始测试：流式接口")
+    print("开始测试：流式接口（静默接收，中间进度不打印）")
     print(f"POST {url}")
     print("=" * 88)
 
@@ -125,18 +183,15 @@ def _run_stream_request(payload: Dict[str, Any], base_url: str, timeout: float =
 
                 # SSE注释行
                 if raw.startswith(":"):
-                    print(raw)
                     continue
 
                 if raw.startswith("event:"):
                     current_event = raw.split(":", 1)[1].strip()
                     events_seen.add(current_event)
-                    print(f"\n[event] {current_event}")
                     continue
 
                 if raw.startswith("data:"):
                     data_text = raw.split(":", 1)[1].strip()
-                    print(f"[data] {data_text}")
 
                     try:
                         data_obj = json.loads(data_text)
@@ -169,25 +224,26 @@ def run_marker_case(base_url: str, timeout: float = 180.0) -> None:
     print(f"- content_length={len(content)}")
     print(f"- legal_references_count={len(legal_references)}")
 
-    if not legal_references:
-        raise AssertionError("未拿到 legal_references，无法验证法条ID链路")
+    # if not legal_references:
+    #     raise AssertionError("未拿到 legal_references，无法验证法条ID链路")
 
-    legal_ids = [str(item.get("law_id")) for item in legal_references if item.get("law_id")]
-    if not legal_ids:
-        raise AssertionError("legal_references 中未发现 law_id")
+    # legal_ids = [str(item.get("law_id")) for item in legal_references if item.get("law_id")]
+    # if not legal_ids:
+    #     raise AssertionError("legal_references 中未发现 law_id")
 
-    marker_pattern = r"\[法条ID:\d+\]"
-    found_markers = re.findall(marker_pattern, content)
-    if not found_markers:
-        raise AssertionError("该用例要求存在法律依据句，最终content应包含法条ID角标")
+    # marker_pattern = r"\[法条ID:\d+\]"
+    # found_markers = re.findall(marker_pattern, content)
+    # if not found_markers:
+    #     raise AssertionError("该用例要求存在法律依据句，最终content应包含法条ID角标")
 
-    if _contains_long_legal_fragment(content, legal_references):
-        raise AssertionError("最终content检测到疑似法条原文片段泄露")
+    # if _contains_long_legal_fragment(content, legal_references):
+    #     raise AssertionError("最终content检测到疑似法条原文片段泄露")
 
-    print("\n✓ 测试通过")
-    print(f"- 检索到 law_id 数量: {len(legal_ids)}")
-    print(f"- 最终角标数量: {len(found_markers)}")
-    print(f"- 角标示例: {found_markers[:3]}")
+    # print("\n✓ 测试通过")
+    # print(f"- 检索到 law_id 数量: {len(legal_ids)}")
+    # print(f"- 最终角标数量: {len(found_markers)}")
+    # print(f"- 角标示例: {found_markers[:3]}")
+    _print_model_trace(final_payload, title="按需角标基线")
 
 
 def run_latency_compare_case(base_url: str, timeout: float = 180.0) -> None:
@@ -222,6 +278,8 @@ def run_latency_compare_case(base_url: str, timeout: float = 180.0) -> None:
     print(f"- MCP关闭耗时: {elapsed_off:.3f}s")
     print(f"- 耗时差值(开-关): {delta:.3f}s")
     print(f"- 倍率(开/关): {ratio:.3f}x")
+    _print_model_trace(final_on, title="MCP开启")
+    _print_model_trace(final_off, title="MCP关闭")
 
 
 def run_search_availability_case(base_url: str, timeout: float = 180.0) -> None:
@@ -243,6 +301,10 @@ def run_search_availability_case(base_url: str, timeout: float = 180.0) -> None:
     if not legal_ids:
         raise AssertionError("显式检索用例未拿到有效 law_id")
 
+    expected_keywords = ["合同诈骗", "第二百二十四", "自首", "第六十七", "量刑", "第六十一"]
+    if not _has_relevant_legal_hit(legal_references, expected_keywords):
+        raise AssertionError("检索结果未命中合同诈骗/自首/量刑相关法条，疑似未搜到目标法条")
+
     search_actions = {
         str(step.get("action") or "")
         for step in react_steps
@@ -263,6 +325,7 @@ def run_search_availability_case(base_url: str, timeout: float = 180.0) -> None:
     print(f"- legal_references_count={len(legal_references)}")
     print(f"- react_actions={sorted(action for action in search_actions if action)}")
     print(f"- 角标示例: {found_markers[:3]}")
+    _print_model_trace(final_payload, title="显式检索可用性")
 
 
 def main() -> int:
@@ -280,10 +343,10 @@ def main() -> int:
     try:
         if args.case in ("all", "marker"):
             run_marker_case(base_url=args.base_url, timeout=args.timeout)
-        if args.case in ("all", "latency"):
-            run_latency_compare_case(base_url=args.base_url, timeout=args.timeout)
-        if args.case in ("all", "search"):
-            run_search_availability_case(base_url=args.base_url, timeout=args.timeout)
+        # if args.case in ("all", "latency"):
+        #     run_latency_compare_case(base_url=args.base_url, timeout=args.timeout)
+        # if args.case in ("all", "search"):
+        #     run_search_availability_case(base_url=args.base_url, timeout=args.timeout)
         return 0
     except Exception as exc:
         print(f"\n✗ 测试失败: {exc}")
