@@ -10,7 +10,7 @@
 
 ---
 重建并启动容器
-docker compose up -d --force-recreate writer-service
+docker compose up -d writer-service
 
 
 cd /data/app/fj-writer-mcp

@@ -149,7 +149,7 @@ class ReactWritingEngine:
         
         return f"""你是一名资深法律写作智能体，负责“流程控制与工具调用”，不负责覆盖用户输入的写作要求。
 
-    你的任务是：在 ReAct 多轮框架下，调用工具、组织证据、最后按“输入提示词”生成正文。
+    你的任务是：在 ReAct 多轮框架下，调用工具、组织证据、最后按“输入提示词”生成一份完整可交付的报告文本。
 
     【优先级规则（必须遵守）】
     1. 最高优先级：输入提示词（task_description）。
@@ -169,16 +169,16 @@ class ReactWritingEngine:
     {tools_desc}
 
     【执行原则】
-    1. 先理解输入提示词的目标与格式，再决定是否检索法条。
+    1. 先理解输入提示词的目标与格式；若启用 MCP 法条搜索，优先检索相关法条后再写作。
     2. 仅当任务或正文需要法律依据时，再使用 search_legal/get_article；禁止臆造法条。
     3. 案件材料用于事实抽取与证据支撑，不得替代输入提示词的输出目标。
-    4. 最终内容必须可交付，且严格贴合输入提示词要求。
+    4. 最终内容必须可交付，且严格贴合输入提示词要求，不强制按章节写作。
     5. 若正文出现明确“法律依据/法条依据/依照某法条”等法律依据句，应使用法条ID角标引用；若正文不涉及法律依据，可不引用。
     6. 角标格式统一为：[法条ID:123]（示例）。
     {strong_reqs_text}
     {citation_rule}
     【注意事项】
-    - 每次只执行一个 Action
+    - 可在同一轮输出多个 Action，系统会按顺序依次执行
     - Action 格式必须严格遵守：Action: 工具名称: 参数
     - FINISH 仅用于结束循环，最终报告会在结束后统一汇总生成
     - 考虑文本长度限制，合理组织内容
@@ -555,7 +555,11 @@ class ReactWritingEngine:
     
     def _parse_actions(self, content: str) -> List[Tuple[str, str]]:
         """解析Action列表，支持同轮多动作按顺序执行。"""
-        matches = re.findall(r"Action\s*[:：]\s*(\w+)\s*[:：]\s*(.+?)(?=\n|$)", content, re.DOTALL | re.IGNORECASE)
+        matches = re.findall(
+            r"Action\s*[:：]\s*(\w+)\s*[:：]\s*(.+?)(?=\n\s*Action\s*[:：]|\Z)",
+            content,
+            re.DOTALL | re.IGNORECASE,
+        )
         return [(tool_name.strip(), tool_args.strip()) for tool_name, tool_args in matches]
 
     def _parse_action(self, content: str) -> Optional[tuple]:
@@ -596,16 +600,15 @@ class ReactWritingEngine:
                     sort_by="relevance",
                     order="desc",
                 )
-                filtered_results = self._filter_legal_results_by_query(raw_results, query)
                 logger.info(
-                    "search_legal query='%s' candidate='%s' raw_count=%s filtered_count=%s",
+                    "search_legal query='%s' candidate='%s' raw_count=%s",
                     query,
                     candidate,
                     len(raw_results),
-                    len(filtered_results),
                 )
-                if filtered_results:
-                    results = filtered_results
+                # 以召回为先，避免过度过滤导致无结果。
+                if raw_results:
+                    results = raw_results
                     query = candidate
                     break
             
@@ -664,7 +667,7 @@ class ReactWritingEngine:
             return results
 
         generic_terms = {"刑法", "民法", "民法典", "刑事诉讼法", "法律", "法条", "量刑"}
-        tokens = [token for token in re.split(r"\s+", normalized_query) if token]
+        tokens = [token for token in re.split(r"[\s,，;；、|/]+", normalized_query) if token]
         specific_tokens = [token for token in tokens if token not in generic_terms and len(token) >= 2]
 
         # 无具体关键词时不过滤，避免误杀。
@@ -686,21 +689,25 @@ class ReactWritingEngine:
         return filtered
 
     def _build_search_query_candidates(self, query: str) -> List[str]:
-        """构建搜索候选词，增强多关键词检索鲁棒性。"""
+        """构建搜索候选词：优先一次命中，少量回退，兼顾效率与召回。"""
         base = (query or "").strip()
         if not base:
             return []
 
         candidates: List[str] = [base]
-        tokens = [token for token in re.split(r"[\s,，;；、|/]+", base) if token]
+        # 多关键词优先按空格切分，兼容中文标点和竖线等分隔符。
+        normalized = re.sub(r"[，;；、|/]+", " ", base)
+        tokens = [token for token in normalized.split(" ") if token]
 
-        # 逐词回退：原查询失败时，尝试关键子词检索并利用后续过滤保障相关性。
+        # 逐词回退最多追加2个，避免请求风暴。
         for token in tokens:
             token = token.strip()
             if len(token) <= 1:
                 continue
             if token not in candidates:
                 candidates.append(token)
+            if len(candidates) >= 3:
+                break
 
         # # 常见法律写作查询可追加法域限定词提升召回。
         # if "刑法" not in base and any(word in base for word in ["诈骗", "盗窃", "量刑", "自首", "共同犯罪"]):
@@ -708,7 +715,7 @@ class ReactWritingEngine:
         #     if scoped not in candidates:
         #         candidates.append(scoped)
 
-        return candidates
+        return candidates[:3]
     
     async def _tool_get_article(self, params: str, context: str, record_reference: bool = True) -> str:
         """获取具体法条"""
@@ -1240,6 +1247,12 @@ class ReactWritingEngine:
                 continue
             seen.add(cleaned)
             deduped.append(cleaned)
+
+        # 没有命中关键词时，回退到任务描述首句，确保开启MCP时至少执行一次相关检索。
+        if not deduped:
+            fallback = re.sub(r"\s+", " ", task).strip()
+            if fallback:
+                deduped.append(fallback[:48])
 
         return deduped[: max(1, self.config.proactive_max_queries)]
 
