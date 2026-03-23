@@ -7,7 +7,18 @@
 4. 容器与网络关系
 5. 常用 Docker 指令
 6. 写作服务接口文档（含流式）
+只改了 .env 或 compose environment：
+docker compose up -d --force-recreate mcp-service writer-service
+docker compose ps
+docker compose logs -f mcp-service
+docker compose logs -f writer-service
+改了 Dockerfile、requirements、代码依赖：
+docker compose build mcp-service writer-service
+docker compose up -d --force-recreate mcp-service writer-service
+docker compose ps
+当前 compose 里 MCP 连接相关配置位置：
 
+writer 的 env_file 与 MCP_SSE_URL、MCP_FORCE_HOST_HEADER 在 docker-compose.yml:39 docker-compose.yml:43 docker-compose.yml:44
 ---
 重建并启动容器
 docker compose up -d writer-service

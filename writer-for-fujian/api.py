@@ -108,6 +108,12 @@ class WriteReportRequest(BaseModel):
     multi_turn_enabled: bool = Field(True, description="是否启用多轮对话")
     proactive_tool_call: bool = Field(True, description="是否启用主动工具调用")
     min_output_length: int = Field(0, description="最小输出长度（字符数，默认0表示不做最小长度约束）", ge=0)
+    legal_search_page_size: int = Field(30, description="法条检索单次页大小", ge=1, le=100)
+    legal_search_fallback_enabled: bool = Field(True, description="法条检索是否启用回退策略")
+    legal_search_fallback_min_results: int = Field(1, description="触发回退的最小命中阈值", ge=0, le=100)
+    legal_search_candidate_limit: int = Field(8, description="回退候选关键词上限", ge=1, le=20)
+    legal_search_token_min_length: int = Field(2, description="回退分词最小长度", ge=1, le=10)
+    legal_search_single_char_whitelist: Optional[List[str]] = Field(None, description="回退分词单字白名单")
     stream_heartbeat_seconds: int = Field(3, description="流式接口心跳间隔秒数", ge=1, le=30)
     
     class Config:
@@ -161,6 +167,12 @@ def _build_config_from_request(req: WriteReportRequest) -> WritingConfig:
         multi_turn_enabled=req.multi_turn_enabled,
         proactive_tool_call=req.proactive_tool_call,
         min_output_length=req.min_output_length,
+        legal_search_page_size=req.legal_search_page_size,
+        legal_search_fallback_enabled=req.legal_search_fallback_enabled,
+        legal_search_fallback_min_results=req.legal_search_fallback_min_results,
+        legal_search_candidate_limit=req.legal_search_candidate_limit,
+        legal_search_token_min_length=req.legal_search_token_min_length,
+        legal_search_single_char_whitelist=req.legal_search_single_char_whitelist or ["税", "罪"],
     )
     return config
 

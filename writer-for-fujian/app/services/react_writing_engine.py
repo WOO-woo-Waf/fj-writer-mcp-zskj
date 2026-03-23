@@ -8,6 +8,7 @@ React 写作引擎
 
 import logging
 import re
+import asyncio
 from typing import Dict, Any, Optional, List, Callable, Tuple
 from dataclasses import dataclass, field
 
@@ -49,6 +50,12 @@ class WritingConfig:
     initial_task_repeat: int = 1
     max_actions_per_turn: int = 5
     max_legal_results_for_observation: int = 30
+    legal_search_page_size: int = 30
+    legal_search_fallback_enabled: bool = True
+    legal_search_fallback_min_results: int = 1
+    legal_search_candidate_limit: int = 8
+    legal_search_token_min_length: int = 2
+    legal_search_single_char_whitelist: List[str] = field(default_factory=lambda: ["税", "罪"])
 
 
 @dataclass
@@ -589,44 +596,100 @@ class ReactWritingEngine:
             return "法条搜索功能未启用"
         
         try:
-            candidate_queries = self._build_search_query_candidates(query)
+            primary_query = (query or "").strip()
+            if not primary_query:
+                return "未找到相关法条"
 
-            results = []
-            for candidate in candidate_queries:
-                raw_results = await self.mcp_client.search_article(
-                    text=candidate,
-                    page=1,
-                    page_size=30,
-                    sort_by="relevance",
-                    order="desc",
-                )
-                logger.info(
-                    "search_legal query='%s' candidate='%s' raw_count=%s",
-                    query,
-                    candidate,
-                    len(raw_results),
-                )
-                # 以召回为先，避免过度过滤导致无结果。
-                if raw_results:
-                    results = raw_results
-                    query = candidate
-                    break
+            primary_results = await self.mcp_client.search_article(
+                text=primary_query,
+                page=1,
+                page_size=self.config.legal_search_page_size,
+                sort_by="relevance",
+                order="desc",
+            )
+            logger.info(
+                "search_legal primary query='%s' raw_count=%s",
+                primary_query,
+                len(primary_results),
+            )
+
+            merged_results: List[Dict[str, Any]] = []
+            for item in primary_results:
+                if not isinstance(item, dict):
+                    continue
+                payload = dict(item)
+                payload["_matched_query"] = primary_query
+                merged_results.append(payload)
+
+            need_fallback = (
+                self.config.legal_search_fallback_enabled
+                and len(primary_results) < max(0, self.config.legal_search_fallback_min_results)
+            )
+
+            if need_fallback:
+                candidate_queries = self._build_search_query_candidates(primary_query)
+                candidate_queries = [candidate for candidate in candidate_queries if candidate != primary_query]
+
+                if candidate_queries:
+                    # 回退阶段按 OR 语义并发检索，再做并集去重。
+                    search_tasks = [
+                        self.mcp_client.search_article(
+                            text=candidate,
+                            page=1,
+                            page_size=self.config.legal_search_page_size,
+                            sort_by="relevance",
+                            order="desc",
+                        )
+                        for candidate in candidate_queries
+                    ]
+                    search_batches = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+                    for candidate, batch in zip(candidate_queries, search_batches):
+                        if isinstance(batch, Exception):
+                            logger.warning(
+                                "search_legal fallback query='%s' candidate='%s' failed: %s",
+                                primary_query,
+                                candidate,
+                                batch,
+                            )
+                            continue
+
+                        logger.info(
+                            "search_legal fallback query='%s' candidate='%s' raw_count=%s",
+                            primary_query,
+                            candidate,
+                            len(batch),
+                        )
+
+                        for item in batch:
+                            if not isinstance(item, dict):
+                                continue
+                            payload = dict(item)
+                            payload["_matched_query"] = candidate
+                            merged_results.append(payload)
+
+            deduped_results: List[Dict[str, Any]] = []
+            seen_result_keys = set()
+            for item in merged_results:
+                title = item.get("title", "未知")
+                article = item.get("section_number", item.get("article", ""))
+                law_id = self._normalize_legal_id(item.get("id"))
+                dedup_key = (title, article, law_id)
+                if dedup_key in seen_result_keys:
+                    continue
+                seen_result_keys.add(dedup_key)
+                deduped_results.append(item)
             
-            if not results:
+            if not deduped_results:
                 return "未找到相关法条"
             
             # 输出检索结果（默认最多max_legal_results_for_observation条，每条携带完整content给模型）
             output_parts = []
-            seen = set()
-            for i, result in enumerate(results[: self.config.max_legal_results_for_observation], 1):
+            for i, result in enumerate(deduped_results[: self.config.max_legal_results_for_observation], 1):
                 title = result.get("title", "未知")
                 article = result.get("section_number", result.get("article", ""))
                 content = result.get("content", "")
                 law_id = self._normalize_legal_id(result.get("id"))
-                dedup_key = (title, article, law_id)
-                if dedup_key in seen:
-                    continue
-                seen.add(dedup_key)
 
                 id_text = law_id if law_id else "未知"
                 output_parts.append(f"{i}. 《{title}》{article} [法条ID:{id_text}]\n{content}")
@@ -637,7 +700,7 @@ class ReactWritingEngine:
                     "title": title,
                     "article": article,
                     "content": result.get("content", ""),
-                    "query": query
+                    "query": result.get("_matched_query", primary_query)
                 }
                 if not record_reference:
                     self._append_unique_reference(self.proactive_legal_references, ref_item)
@@ -689,33 +752,38 @@ class ReactWritingEngine:
         return filtered
 
     def _build_search_query_candidates(self, query: str) -> List[str]:
-        """构建搜索候选词：优先一次命中，少量回退，兼顾效率与召回。"""
+        """构建搜索回退候选词：从整句拆词用于回退检索。"""
         base = (query or "").strip()
         if not base:
             return []
 
-        candidates: List[str] = [base]
-        # 多关键词优先按空格切分，兼容中文标点和竖线等分隔符。
-        normalized = re.sub(r"[，;；、|/]+", " ", base)
-        tokens = [token for token in normalized.split(" ") if token]
+        # 兼容空格、中文标点、竖线等分隔符。
+        tokens = [token.strip() for token in re.split(r"[\s,，;；、|/]+", base) if token.strip()]
 
-        # 逐词回退最多追加2个，避免请求风暴。
+        # 去重并过滤超短词。
+        unique_tokens: List[str] = []
+        seen = set()
+        token_min_length = max(1, self.config.legal_search_token_min_length)
+        single_char_whitelist = set(self.config.legal_search_single_char_whitelist or [])
         for token in tokens:
-            token = token.strip()
-            if len(token) <= 1:
+            if len(token) < token_min_length and token not in single_char_whitelist:
                 continue
+            if token in seen:
+                continue
+            seen.add(token)
+            unique_tokens.append(token)
+
+        if not unique_tokens:
+            return [base]
+
+        # 回退候选包含原始查询，调用方可按策略决定是否先查整句。
+        candidates = [base]
+        for token in unique_tokens:
             if token not in candidates:
                 candidates.append(token)
-            if len(candidates) >= 3:
+            if len(candidates) >= max(1, self.config.legal_search_candidate_limit):
                 break
-
-        # # 常见法律写作查询可追加法域限定词提升召回。
-        # if "刑法" not in base and any(word in base for word in ["诈骗", "盗窃", "量刑", "自首", "共同犯罪"]):
-        #     scoped = f"{base} 刑法"
-        #     if scoped not in candidates:
-        #         candidates.append(scoped)
-
-        return candidates[:3]
+        return candidates
     
     async def _tool_get_article(self, params: str, context: str, record_reference: bool = True) -> str:
         """获取具体法条"""

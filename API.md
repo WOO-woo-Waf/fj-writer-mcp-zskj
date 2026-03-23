@@ -74,6 +74,23 @@
   - `min_output_length` (int，默认 `0`，最小值 `0`)：
     最小输出长度（按字符数计）。`0` 表示不启用最小长度约束，完全由调用方控制。
     当设置为大于 `0` 时，服务会尽量确保最终输出不少于该值。
+  - `legal_search_page_size` (int，默认 `30`，范围 `1-100`)：
+    法条检索单次请求页大小。当前生效。
+  - `legal_search_fallback_enabled` (bool，默认 `true`)：
+    法条检索回退开关。当前生效。
+  - `legal_search_fallback_min_results` (int，默认 `1`)：
+    主查询命中数量小于该阈值时触发回退。当前生效。
+  - `legal_search_candidate_limit` (int，默认 `8`，范围 `1-20`)：
+    回退分词候选上限。当前生效。
+  - `legal_search_token_min_length` (int，默认 `2`，范围 `1-10`)：
+    回退分词最小长度。当前生效。
+  - `legal_search_single_char_whitelist` (string[]，默认 `["税","罪"]`)：
+    回退分词单字白名单。当前生效。
+
+法条检索策略说明（当前版本）：
+- 先用完整 query 调用 MCP 的 `search_article`
+- 若命中不足（`< legal_search_fallback_min_results`）再执行分词回退
+- 回退阶段对候选词并发检索并做去重并集
 
 请求示例：
 
@@ -84,7 +101,13 @@
   "enable_legal_search": true,
   "max_react_steps": 10,
   "temperature": 0.2,
-  "min_output_length": 0
+  "min_output_length": 0,
+  "legal_search_page_size": 30,
+  "legal_search_fallback_enabled": true,
+  "legal_search_fallback_min_results": 1,
+  "legal_search_candidate_limit": 8,
+  "legal_search_token_min_length": 2,
+  "legal_search_single_char_whitelist": ["税", "罪"]
 }
 ```
 
@@ -126,6 +149,13 @@
 请求参数：
 - 与 `/api/write` 基本一致
 - 可通过 `min_output_length` 控制最小输出长度（默认 `0`，表示不限制）
+- 支持法条检索策略参数：
+  - `legal_search_page_size`
+  - `legal_search_fallback_enabled`
+  - `legal_search_fallback_min_results`
+  - `legal_search_candidate_limit`
+  - `legal_search_token_min_length`
+  - `legal_search_single_char_whitelist`
 - 额外可选：`stream_heartbeat_seconds` (int，默认 `3`，范围 `1-30`)：
   控制 `progress` 心跳事件发送间隔（每隔 N 秒推一次进度），主要用于连接保活和前端进度反馈。
   说明：该参数只影响流式心跳频率，不改变模型推理结果与写作质量；若客户端不消费 `progress`，调大调小可能看起来“没有功能变化”。
@@ -224,6 +254,12 @@ Docker 部署注意：
 - 命中：法条对象
 - 未命中：`{}`
 
+匹配策略（当前版本）：
+- `title ILIKE` 前置过滤
+- 条号做标准化候选（原文/去空白/阿拉伯/中文）
+- 单次 SQL 按 score 排序，不做 Python 循环多次查询
+- 优先级：`section_number` 命中 > `content` 命中 > 标题近似加权
+
 示例：
 
 ```json
@@ -252,6 +288,12 @@ Docker 部署注意：
 返回：
 - 命中：数组（每项为法条对象，含 `relevance`）
 - 未命中：`[]`
+
+检索策略（当前版本）：
+- 多关键词按 OR 关系召回（宽召回）
+- 默认按 `relevance desc` 排序
+- 当 `sort_by != relevance` 时，按指定字段排序
+- 分词规则可配置（token 上限、最小长度、单字白名单）
 
 示例：
 
